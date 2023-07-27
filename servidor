@@ -1,29 +1,158 @@
 #!/usr/bin/env python3
 import asyncio
+from socket import SOCK_STREAM
 from tcp import Servidor
 import re
-
+from socket import *
 
 def validar_nome(nome):
     return re.match(br'^[a-zA-Z][a-zA-Z0-9_-]*$', nome) is not None
 
 
-def sair(conexao):
+def sair(conexao, lista_msg):
     print(conexao, 'conexão fechada')
+     # PASSO 10
+    for text in lista_msg:
+            text.enviar(b':' + conexao.id_nick + b' QUIT :Connection closed\r\n')
     conexao.fechar()
 
 
 def dados_recebidos(conexao, dados):
+    dados = conexao.dados_res + dados
+    conexao.dados_res = b''
+
+    # PASSO 8
     if dados == b'':
-        return sair(conexao)
-    print(conexao, dados)
+        lista_msg = [] 
+        for canal in conexao.canais:
+            servidor.canais[canal].pop(conexao.id_nick, None)
+            for chave in servidor.canais[canal]:
+                lista_msg.append(servidor.canais[canal][chave])
+        lista_msg = list(dict.fromkeys(lista_msg))
+        servidor.conexoes.remove(conexao)
+        return sair(conexao, lista_msg)
+
+    # PASSO 2
+    if not dados.endswith(b'\r\n'):
+        dados = dados.split(b'\r\n')
+        conexao.dados_res += dados.pop(-1)
+    else:
+        dados = dados.split(b'\r\n')
+
+    
+    
+    if dados:
+        for mensagem in dados:
+            codigo, payload = mensagem.split(b' ', 1)
+            
+            # PASSO 1
+            if codigo.upper() == b'PING':
+                envio = b':server PONG server :' + payload + b'\r\n'
+                conexao.enviar(envio)
+
+            #PASSO 3 e 4
+            if codigo.upper() == b'NICK':
+                if(validar_nome(payload)): # Validacao do NICK
+                    usado = 0
+                    for i in servidor.conexoes :
+                        if i.id_nick.upper() == payload.upper() and i != conexao:
+                            usado = 1
+                            in_use = b':server 433 ' + conexao.id_nick + b' ' + payload + b' :Nickname is already in use\r\n'
+                            conexao.enviar(in_use)
+                            
+                    if usado == 0:
+                        if conexao.id_nick == b'*': # Primeiro nome
+
+                            # Mensagem de bem vindo
+                            msg_001 = b':server 001 ' + payload + b' :Welcome\r\n'
+                            conexao.enviar(msg_001)
+
+                            msg_422 = b':server 422 ' + payload + b' :MOTD File is missing\r\n'
+                            conexao.enviar(msg_422)
+                            conexao.id_nick = payload
+                        
+                        else: # Troca de nick
+                            conexao.enviar(b':' + conexao.id_nick + b' NICK ' + payload + b'\r\n')
+                            conexao.id_nick = payload
+                else: # NICK invalido
+                    nick_invalido = b':server 432 ' + conexao.id_nick + b' ' + payload + b' :Erroneous nickname\r\n'
+                    conexao.enviar(nick_invalido)
+
+            #PASSO 5 
+            if codigo.upper() == b'PRIVMSG':
+                dest, cont = payload.split(b' ', 1)
+                if dest.startswith(b'#') and dest.upper() in servidor.canais.keys(): # Mensagem em grupo
+                    for chave in servidor.canais[dest.upper()]:
+                        if servidor.canais[dest.upper()][chave] != conexao:
+                            envio = b':' + conexao.id_nick + b' PRIVMSG ' + dest + b' ' + cont + b'\r\n'
+                            servidor.canais[dest.upper()][chave].enviar(envio)
+
+                else: # Mensagem individual
+                    dest_conexao = None
+                    for i in servidor.conexoes:
+                        if i.id_nick.upper() == dest.upper():
+                            dest_conexao = i
+                    if dest_conexao:
+                        envio = b':' + conexao.id_nick + b' PRIVMSG ' + dest_conexao.id_nick + b' ' + cont + b'\r\n'
+                        dest_conexao.enviar(envio)
+                
+            #PASSO 6 - Conecta em um canal
+            if codigo.upper() == b'JOIN':
+                if payload.startswith(b'#') and validar_nome(payload[1:]):
+                    if payload.upper() not in servidor.canais.keys():
+                        servidor.canais[payload.upper()] = {}
+                    servidor.canais[payload.upper()][conexao.id_nick] = conexao
+                    
+                    if payload.upper() not in conexao.canais:
+                        conexao.canais.append(payload.upper())
+                    membros = b''    
+                    
+                    for chave in servidor.canais[payload.upper()]:
+                        join_canal = b':' + conexao.id_nick + b' JOIN :' + payload + b'\r\n'
+                        servidor.canais[payload.upper()][chave].enviar(join_canal)
+                    
+                    # Passo 9 - enviando lista com os membros do canal
+                    for chave in sorted(servidor.canais[payload.upper()].keys()): 
+                        membros += chave + b' '
+                    send = b':server 353 ' + conexao.id_nick + b' = ' + payload + b' :' + membros
+                    while len(send) > 510:
+                        restante = send[:510]
+                        conexao.enviar(send + b'\r\n')
+                        send = restante
+                        
+                    conexao.enviar(send + b'\r\n')
+                    conexao.enviar(b':server 366 ' + conexao.id_nick + b' ' + payload + b' :End of /NAMES list.\r\n')
+                        
+                else:
+                    erro_canal = b':server 403 ' + payload + b' :No such channel.\r\n'
+                    conexao.enviar(erro_canal)
+                
+            #PASSO 7
+            if codigo.upper() == b'PART':
+                payload = payload.split(b' ')[0]
+                if payload.upper() in servidor.canais.keys():
+                    if conexao.id_nick in servidor.canais[payload.upper()].keys():
+                        for chave in servidor.canais[payload.upper()]:
+                            servidor.canais[payload.upper()][chave].enviar(b':' + conexao.id_nick + b' PART ' + payload + b'\r\n')
+                        del servidor.canais[payload.upper()][conexao.id_nick]
+                        conexao.canais.remove(payload.upper())
+
+
+            print(conexao, dados)
+    
 
 
 def conexao_aceita(conexao):
     print(conexao, 'nova conexão')
+    conexao.dados_res = b''
+    conexao.id_nick = b'*'
+    conexao.canais = []
+    servidor.conexoes.append(conexao)
     conexao.registrar_recebedor(dados_recebidos)
 
 
 servidor = Servidor(6667)
+servidor.canais = {}
+servidor.conexoes = []
 servidor.registrar_monitor_de_conexoes_aceitas(conexao_aceita)
 asyncio.get_event_loop().run_forever()
